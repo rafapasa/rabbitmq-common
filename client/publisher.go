@@ -8,19 +8,17 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rabbitmq/amqp091-go"
-	"github.com/rafapasa/rabbitmq-common/events"
 	"github.com/rafapasa/rabbitmq-common/metrics"
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-// Publisher handles message publishing with metrics
+// Publisher handles message publishing (generic)
 type Publisher struct {
 	connection *amqp091.Connection
 	channel    *amqp091.Channel
 	metrics    *metrics.Metrics
 }
 
-// NewPublisher creates a new publisher
 func NewPublisher(conn *amqp091.Connection) (*Publisher, error) {
 	ch, err := conn.Channel()
 	if err != nil {
@@ -34,17 +32,21 @@ func NewPublisher(conn *amqp091.Connection) (*Publisher, error) {
 	}, nil
 }
 
-// PublishEvent publishes a generic event
-func (p *Publisher) PublishEvent(ctx context.Context, routingKey string, payload interface{}) error {
+// Publish publishes ANY message with a routing key
+// O projeto que usa decide o que vai no payload
+func (p *Publisher) Publish(ctx context.Context, routingKey string, payload interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("error serializing: %w", err)
 	}
 
-	// Get queue name from routing key
+	// Get queue name from routing key (optional, for metrics)
 	queueName := queue.RoutingToQueue[routingKey]
+	if queueName == "" {
+		return fmt.Errorf("invalid routing key: %s", routingKey)
+	}
 
-	// Metrics: publish
+	// Metrics
 	p.metrics.RecordPublished(queueName, routingKey)
 	p.metrics.RecordMessageSize(queueName, len(body))
 
@@ -70,34 +72,4 @@ func (p *Publisher) PublishEvent(ctx context.Context, routingKey string, payload
 	}
 
 	return nil
-}
-
-// PublishOrderCreated publishes an order created event
-func (p *Publisher) PublishOrderCreated(ctx context.Context, order events.OrderCreatedPayload) error {
-	order.EventID = uuid.New().String()
-	order.EventType = events.EventTypeOrderCreated
-	order.Timestamp = time.Now()
-	order.Version = 1
-
-	return p.PublishEvent(ctx, queue.RoutingKeyOrderCreated, order)
-}
-
-// PublishOrderPaid publishes an order paid event
-func (p *Publisher) PublishOrderPaid(ctx context.Context, payment events.OrderPaidPayload) error {
-	payment.EventID = uuid.New().String()
-	payment.EventType = events.EventTypeOrderPaid
-	payment.Timestamp = time.Now()
-	payment.Version = 1
-
-	return p.PublishEvent(ctx, queue.RoutingKeyOrderPaid, payment)
-}
-
-// PublishOrderCanceled publishes an order canceled event
-func (p *Publisher) PublishOrderCanceled(ctx context.Context, canceled events.OrderCanceledPayload) error {
-	canceled.EventID = uuid.New().String()
-	canceled.EventType = events.EventTypeOrderCanceled
-	canceled.Timestamp = time.Now()
-	canceled.Version = 1
-
-	return p.PublishEvent(ctx, queue.RoutingKeyOrderCanceled, canceled)
 }

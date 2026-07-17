@@ -1,69 +1,57 @@
+// projeto-payments/cmd/main.go
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
+	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rafapasa/rabbitmq-common/client"
-	"github.com/rafapasa/rabbitmq-common/events"
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-func main() {
-	// 1. Start metrics server
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		log.Fatal(http.ListenAndServe(":8080", nil))
-	}()
+type PaymentProcessed struct {
+	PaymentID   string    `json:"payment_id"`
+	OrderID     string    `json:"order_id"`
+	Amount      float64   `json:"amount"`
+	ProcessedAt time.Time `json:"processed_at"`
+	Status      string    `json:"status"`
+}
 
-	// 2. Connect to RabbitMQ
-	conn, err := amqp091.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		log.Fatal(err)
-	}
+func main() {
+	conn, _ := amqp091.Dial("amqp://guest:guest@localhost:5672/")
 	defer conn.Close()
 
-	// 3. Create consumer
-	consumer, err := client.NewConsumer(conn)
-	if err != nil {
-		log.Fatal(err)
+	// Publisher genérico para pagamentos
+	publisher, _ := client.NewPublisher(conn)
+
+	payment := PaymentProcessed{
+		PaymentID: "PAY-789",
+		OrderID:   "ORD-123",
+		Amount:    750.00,
+		Status:    "approved",
 	}
 
-	// 4. Define business handler
+	publisher.Publish(context.Background(), queue.RoutingKeyPayments, payment)
+
+	// Consumer específico para pagamentos
+	consumer, _ := client.NewConsumer(conn)
+
 	handler := func(ctx context.Context, delivery amqp091.Delivery) error {
-		var order events.OrderCreatedPayload
-		if err := json.Unmarshal(delivery.Body, &order); err != nil {
+		var payment PaymentProcessed
+		if err := json.Unmarshal(delivery.Body, &payment); err != nil {
 			return err
 		}
 
-		// Process order
-		log.Printf("📦 Processing order: %s", order.OrderID)
-
-		// Simulate error for testing DLQ
-		if order.TotalValue > 1000 {
-			return fmt.Errorf("order above R$1000 needs approval")
-		}
+		log.Printf("💳 Processando pagamento: %s", payment.PaymentID)
+		// Lógica de negócio específica de pagamentos...
 
 		return nil
 	}
 
-	// 5. Consume with DLQ, metrics and middlewares
-	err = consumer.Consume(
-		queue.QueueOrders,
-		handler,
-		5, // 5 workers
-	)
+	consumer.Consume(queue.QueuePayments, handler, 3)
 
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// 6. Keep running
-	log.Println("🚀 Consumer started. Press CTRL+C to stop.")
 	select {}
 }
