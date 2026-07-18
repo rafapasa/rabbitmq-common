@@ -12,51 +12,59 @@ import (
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-// Consumer handles message consumption (generic)
+// Consumer agora recebe um QueueManager
 type Consumer struct {
-	connection *amqp091.Connection
-	channel    *amqp091.Channel
-	metrics    *metrics.Metrics
+	connection   *amqp091.Connection
+	channel      *amqp091.Channel
+	metrics      *metrics.Metrics
+	queueManager *queue.QueueManager // Gerenciador de filas do projeto
 }
 
-func NewConsumer(conn *amqp091.Connection) (*Consumer, error) {
+// NewConsumer cria um consumer com um gerenciador de filas específico
+func NewConsumer(conn *amqp091.Connection, qm *queue.QueueManager) (*Consumer, error) {
 	ch, err := conn.Channel()
 	if err != nil {
 		return nil, err
 	}
 
 	return &Consumer{
-		connection: conn,
-		channel:    ch,
-		metrics:    metrics.GetMetrics(),
+		connection:   conn,
+		channel:      ch,
+		metrics:      metrics.GetMetrics(),
+		queueManager: qm,
 	}, nil
 }
 
-// Consume starts consuming from a queue
-// O projeto que usa decide como processar (handler)
+// Consume inicia o consumo de uma fila específica
 func (c *Consumer) Consume(
 	queueName string,
-	handler middleware.HandlerFunc, // Handler genérico!
+	handler middleware.HandlerFunc,
 	workers int,
 ) error {
-	// Setup queue with DLQ
-	if err := c.setupQueue(queueName); err != nil {
+	// Pega a configuração da fila do gerenciador do projeto
+	config, exists := c.queueManager.GetQueueConfig(queueName)
+	if !exists {
+		return fmt.Errorf("queue %s not registered in QueueManager", queueName)
+	}
+
+	// Configura a fila com DLQ usando as configurações do projeto
+	if err := c.setupQueue(config); err != nil {
 		return err
 	}
 
-	// Apply middlewares (genéricos)
+	// Aplica middlewares
 	finalHandler := middleware.Chain(
 		handler,
 		middleware.LoggingMiddleware,
 		c.metricsMiddleware,
-		c.dlqMiddleware(queueName),
+		c.dlqMiddleware(config), // Passa a configuração específica
 	)
 
-	// Start consuming
+	// Inicia consumo
 	deliveries, err := c.channel.Consume(
 		queueName,
 		"",
-		false, // auto-ack = false
+		false,
 		false,
 		false,
 		false,
@@ -82,13 +90,9 @@ func (c *Consumer) Consume(
 	return nil
 }
 
-// setupQueue configura a fila com DLQ
-func (c *Consumer) setupQueue(queueName string) error {
-	config, exists := queue.QueueConfigs[queueName]
-	if !exists {
-		return fmt.Errorf("queue %s not configured", queueName)
-	}
-
+// setupQueue configura uma fila com suas configurações específicas
+func (c *Consumer) setupQueue(config queue.QueueConfig) error {
+	// Declara fila principal
 	_, err := c.channel.QueueDeclare(
 		config.Name,
 		config.Durable,
@@ -101,8 +105,13 @@ func (c *Consumer) setupQueue(queueName string) error {
 		return err
 	}
 
+	// Se DLQ estiver habilitada, declara a fila morta
 	if config.DLQEnabled {
-		dlqConfig := queue.QueueConfigs[config.DLQName]
+		dlqConfig, exists := c.queueManager.GetQueueConfig(config.DLQName)
+		if !exists {
+			return fmt.Errorf("DLQ %s not registered in QueueManager", config.DLQName)
+		}
+
 		_, err = c.channel.QueueDeclare(
 			dlqConfig.Name,
 			dlqConfig.Durable,
@@ -119,14 +128,13 @@ func (c *Consumer) setupQueue(queueName string) error {
 	return nil
 }
 
-// dlqMiddleware (mesmo código anterior, genérico)
-func (c *Consumer) dlqMiddleware(queueName string) middleware.Middleware {
+// dlqMiddleware agora usa a configuração específica
+func (c *Consumer) dlqMiddleware(config queue.QueueConfig) middleware.Middleware {
 	return func(next middleware.HandlerFunc) middleware.HandlerFunc {
 		return func(ctx context.Context, delivery amqp091.Delivery) error {
 			err := next(ctx, delivery)
 			if err != nil {
 				retryCount := getRetryCount(delivery)
-				config := queue.QueueConfigs[queueName]
 
 				if retryCount < config.DLQMaxRetries {
 					if delivery.Headers == nil {
@@ -136,7 +144,7 @@ func (c *Consumer) dlqMiddleware(queueName string) middleware.Middleware {
 					return delivery.Reject(true)
 				}
 
-				c.metrics.RecordDLQ(queueName)
+				c.metrics.RecordDLQ(config.Name)
 				return c.publishToDLQ(delivery, config.DLQName)
 			}
 			return delivery.Ack(false)
@@ -144,7 +152,7 @@ func (c *Consumer) dlqMiddleware(queueName string) middleware.Middleware {
 	}
 }
 
-// metricsMiddleware (mesmo código anterior)
+// metricsMiddleware (mesmo de antes)
 func (c *Consumer) metricsMiddleware(next middleware.HandlerFunc) middleware.HandlerFunc {
 	return func(ctx context.Context, delivery amqp091.Delivery) error {
 		queueName := delivery.RoutingKey
@@ -162,7 +170,7 @@ func (c *Consumer) metricsMiddleware(next middleware.HandlerFunc) middleware.Han
 	}
 }
 
-// publishToDLQ (mesmo código anterior)
+// publishToDLQ (mesmo de antes)
 func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error {
 	if delivery.Headers == nil {
 		delivery.Headers = make(amqp091.Table)
@@ -189,7 +197,6 @@ func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error
 	return delivery.Ack(false)
 }
 
-// getRetryCount (mesmo código anterior)
 func getRetryCount(delivery amqp091.Delivery) int {
 	if delivery.Headers == nil {
 		return 0

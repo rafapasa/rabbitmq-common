@@ -12,48 +12,48 @@ import (
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-// Publisher handles message publishing (generic)
 type Publisher struct {
-	connection *amqp091.Connection
-	channel    *amqp091.Channel
-	metrics    *metrics.Metrics
+	connection   *amqp091.Connection
+	channel      *amqp091.Channel
+	metrics      *metrics.Metrics
+	queueManager *queue.QueueManager
 }
 
-func NewPublisher(conn *amqp091.Connection) (*Publisher, error) {
+func NewPublisher(conn *amqp091.Connection, qm *queue.QueueManager) (*Publisher, error) {
 	ch, err := conn.Channel()
 	if err != nil {
 		return nil, err
 	}
 
 	return &Publisher{
-		connection: conn,
-		channel:    ch,
-		metrics:    metrics.GetMetrics(),
+		connection:   conn,
+		channel:      ch,
+		metrics:      metrics.GetMetrics(),
+		queueManager: qm,
 	}, nil
 }
 
-// Publish publishes ANY message with a routing key
-// O projeto que usa decide o que vai no payload
+// Publish publica uma mensagem com routing key
 func (p *Publisher) Publish(ctx context.Context, routingKey string, payload interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("error serializing: %w", err)
 	}
 
-	// Get queue name from routing key (optional, for metrics)
-	queueName := queue.RoutingToQueue[routingKey]
-	if queueName == "" {
-		return fmt.Errorf("invalid routing key: %s", routingKey)
+	// Obtém o nome da fila a partir do routing key (usando o manager do projeto)
+	queueName, exists := p.queueManager.GetQueueByRouting(routingKey)
+	if !exists {
+		return fmt.Errorf("routing key %s not registered", routingKey)
 	}
 
-	// Metrics
+	// Métricas
 	p.metrics.RecordPublished(queueName, routingKey)
 	p.metrics.RecordMessageSize(queueName, len(body))
 
-	// Publish
+	// Publica
 	err = p.channel.PublishWithContext(
 		ctx,
-		queue.ExchangeMain,
+		"", // exchange vazia = default
 		routingKey,
 		false,
 		false,
