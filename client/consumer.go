@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go"
@@ -12,59 +13,108 @@ import (
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-// Consumer agora recebe um QueueManager
+// ConnectionManager interface para gerenciamento de conexão
+type ConnectionManager interface {
+	GetConnection() (*amqp091.Connection, error)
+	GetChannel() (*amqp091.Channel, error)
+	IsConnected() bool
+	Connect() error
+}
+
+// Consumer agora recebe um QueueManager e um ConnectionManager
 type Consumer struct {
-	connection   *amqp091.Connection
-	channel      *amqp091.Channel
-	metrics      *metrics.Metrics
-	queueManager *queue.QueueManager // Gerenciador de filas do projeto
+	connManager    ConnectionManager
+	queueManager   *queue.QueueManager
+	metrics        *metrics.Metrics
+	mu             sync.RWMutex
+	stopChan       chan struct{}
+	isRunning      bool
 }
 
-// NewConsumer cria um consumer com um gerenciador de filas específico
-func NewConsumer(conn *amqp091.Connection, qm *queue.QueueManager) (*Consumer, error) {
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, err
-	}
-
+// NewConsumer cria um consumer com gerenciadores
+func NewConsumer(qm *queue.QueueManager, connManager ConnectionManager) *Consumer {
 	return &Consumer{
-		connection:   conn,
-		channel:      ch,
-		metrics:      metrics.GetMetrics(),
+		connManager:  connManager,
 		queueManager: qm,
-	}, nil
+		metrics:      metrics.GetMetrics(),
+		stopChan:     make(chan struct{}),
+	}
 }
 
-// Consume inicia o consumo de uma fila específica
+// Consume inicia o consumo com reconexão automática
 func (c *Consumer) Consume(
 	queueName string,
 	handler middleware.HandlerFunc,
 	workers int,
 ) error {
-	// Pega a configuração da fila do gerenciador do projeto
+	c.mu.Lock()
+	if c.isRunning {
+		c.mu.Unlock()
+		return fmt.Errorf("consumer already running for queue %s", queueName)
+	}
+	c.isRunning = true
+	c.mu.Unlock()
+
+	go c.consumeWithReconnect(queueName, handler, workers)
+	return nil
+}
+
+// consumeWithReconnect mantém o consumo rodando mesmo com falhas
+func (c *Consumer) consumeWithReconnect(queueName string, handler middleware.HandlerFunc, workers int) {
+	for {
+		select {
+		case <-c.stopChan:
+			log.Printf("🛑 Consumidor parado para fila: %s", queueName)
+			return
+		default:
+			if err := c.consume(queueName, handler, workers); err != nil {
+				log.Printf("❌ Erro no consumo da fila %s: %v", queueName, err)
+				log.Printf("⏳ Tentando reconectar em 5 segundos...")
+				time.Sleep(5 * time.Second)
+				
+				// Tenta reconectar
+				if err := c.connManager.Connect(); err != nil {
+					log.Printf("❌ Falha na reconexão: %v", err)
+					continue
+				}
+			}
+		}
+	}
+}
+
+// consume executa o consumo propriamente dito
+func (c *Consumer) consume(queueName string, handler middleware.HandlerFunc, workers int) error {
+	// 1. Obtém a configuração da fila
 	config, exists := c.queueManager.GetQueueConfig(queueName)
 	if !exists {
 		return fmt.Errorf("queue %s not registered in QueueManager", queueName)
 	}
 
-	// Configura a fila com DLQ usando as configurações do projeto
-	if err := c.setupQueue(config); err != nil {
+	// 2. Obtém um canal ativo
+	ch, err := c.connManager.GetChannel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	// 3. Configura a fila
+	if err := c.setupQueueWithChannel(ch, config); err != nil {
 		return err
 	}
 
-	// Aplica middlewares
+	// 4. Aplica middlewares
 	finalHandler := middleware.Chain(
 		handler,
 		middleware.LoggingMiddleware,
 		c.metricsMiddleware,
-		c.dlqMiddleware(config), // Passa a configuração específica
+		c.dlqMiddleware(config),
 	)
 
-	// Inicia consumo
-	deliveries, err := c.channel.Consume(
+	// 5. Inicia consumo
+	deliveries, err := ch.Consume(
 		queueName,
 		"",
-		false,
+		false, // auto-ack = false
 		false,
 		false,
 		false,
@@ -74,10 +124,15 @@ func (c *Consumer) Consume(
 		return err
 	}
 
+	log.Printf("📨 Consumindo da fila: %s com %d workers", queueName, workers)
 	c.metrics.SetActiveWorkers(workers)
 
+	// 6. Dispara workers
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
+		wg.Add(1)
 		go func(workerID int) {
+			defer wg.Done()
 			for delivery := range deliveries {
 				ctx := context.Background()
 				if err := finalHandler(ctx, delivery); err != nil {
@@ -87,13 +142,19 @@ func (c *Consumer) Consume(
 		}(i)
 	}
 
+	// Aguarda todos os workers terminarem
+	wg.Wait()
 	return nil
 }
 
-// setupQueue configura uma fila com suas configurações específicas
-func (c *Consumer) setupQueue(config queue.QueueConfig) error {
+// setupQueueWithChannel configura uma fila com um canal específico
+func (c *Consumer) setupQueueWithChannel(ch *amqp091.Channel, config queue.QueueConfig) error {
+	if ch == nil || ch.IsClosed() {
+		return fmt.Errorf("channel is closed")
+	}
+
 	// Declara fila principal
-	_, err := c.channel.QueueDeclare(
+	_, err := ch.QueueDeclare(
 		config.Name,
 		config.Durable,
 		config.AutoDelete,
@@ -112,7 +173,7 @@ func (c *Consumer) setupQueue(config queue.QueueConfig) error {
 			return fmt.Errorf("DLQ %s not registered in QueueManager", config.DLQName)
 		}
 
-		_, err = c.channel.QueueDeclare(
+		_, err = ch.QueueDeclare(
 			dlqConfig.Name,
 			dlqConfig.Durable,
 			dlqConfig.AutoDelete,
@@ -128,7 +189,7 @@ func (c *Consumer) setupQueue(config queue.QueueConfig) error {
 	return nil
 }
 
-// dlqMiddleware agora usa a configuração específica
+// dlqMiddleware (mesmo de antes)
 func (c *Consumer) dlqMiddleware(config queue.QueueConfig) middleware.Middleware {
 	return func(next middleware.HandlerFunc) middleware.HandlerFunc {
 		return func(ctx context.Context, delivery amqp091.Delivery) error {
@@ -177,8 +238,14 @@ func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error
 	}
 	delivery.Headers["x-dlq-reason"] = "max_retries_exceeded"
 	delivery.Headers["x-dlq-timestamp"] = time.Now()
+	
+	ch, err := c.connManager.GetChannel()
+	if err != nil {
+		return fmt.Errorf("error getting channel for DLQ publish: %w", err)
+	}
+	defer ch.Close()
 
-	err := c.channel.Publish(
+	err = ch.Publish(
 		"",
 		dlqName,
 		false,
@@ -197,6 +264,17 @@ func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error
 	return delivery.Ack(false)
 }
 
+// Stop para o consumidor
+func (c *Consumer) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.isRunning {
+		close(c.stopChan)
+		c.isRunning = false
+	}
+}
+
+// getRetryCount (mesmo de antes)
 func getRetryCount(delivery amqp091.Delivery) int {
 	if delivery.Headers == nil {
 		return 0
