@@ -108,7 +108,7 @@ func (c *Consumer) consume(queueName string, handler middleware.HandlerFunc, wor
 		middleware.LoggingMiddleware,
 		middleware.OpenTelemetryMiddleware, // Adicionado
 		c.metricsMiddleware(queueName),     // Passa o nome da fila
-		c.dlqMiddleware(config, queueName),
+		c.dlqMiddleware(config),
 	)
 
 	// 5. Inicia consumo
@@ -215,20 +215,21 @@ func (c *Consumer) dlqMiddleware(config queue.QueueConfig) middleware.Middleware
 }
 
 // metricsMiddleware (mesmo de antes)
-func (c *Consumer) metricsMiddleware(next middleware.HandlerFunc) middleware.HandlerFunc {
-	return func(ctx context.Context, delivery amqp091.Delivery) error {
-		queueName := delivery.RoutingKey
-		start := time.Now()
-		c.metrics.RecordConsumed(queueName, delivery.RoutingKey)
-		c.metrics.RecordMessageSize(queueName, len(delivery.Body))
+func (c *Consumer) metricsMiddleware(queueName string) middleware.Middleware {
+	return func(next middleware.HandlerFunc) middleware.HandlerFunc {
+		return func(ctx context.Context, delivery amqp091.Delivery) error {
+			start := time.Now()
+			c.metrics.RecordConsumed(queueName, delivery.RoutingKey)
+			c.metrics.RecordMessageSize(queueName, len(delivery.Body))
 
-		err := next(ctx, delivery)
+			err := next(ctx, delivery)
 
-		c.metrics.RecordProcessingDuration(queueName, time.Since(start))
-		if err != nil {
-			c.metrics.RecordFailure(queueName, fmt.Sprintf("%T", err))
+			c.metrics.RecordProcessingDuration(queueName, time.Since(start))
+			if err != nil {
+				c.metrics.RecordFailure(queueName, fmt.Sprintf("%T", err))
+			}
+			return err
 		}
-		return err
 	}
 }
 
