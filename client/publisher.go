@@ -13,21 +13,21 @@ import (
 )
 
 type Publisher struct {
-	connection   *amqp091.Connection
-	channel      *amqp091.Channel
+	connManager ConnectionManager
+	//channel      *amqp091.Channel
 	metrics      *metrics.Metrics
 	queueManager *queue.QueueManager
 }
 
-func NewPublisher(conn *amqp091.Connection, qm *queue.QueueManager) (*Publisher, error) {
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, err
-	}
+func NewPublisher(cm ConnectionManager, qm *queue.QueueManager) (*Publisher, error) {
+	// ch, err := cm.GetChannel()
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	return &Publisher{
-		connection:   conn,
-		channel:      ch,
+		connManager: cm,
+		// channel:      ch,
 		metrics:      metrics.GetMetrics(),
 		queueManager: qm,
 	}, nil
@@ -51,7 +51,18 @@ func (p *Publisher) Publish(ctx context.Context, routingKey string, payload inte
 	p.metrics.RecordMessageSize(queueName, len(body))
 
 	// Publica
-	err = p.channel.PublishWithContext(
+	conn, err := p.connManager.GetConnection()
+	if err != nil {
+		return err
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	err = ch.PublishWithContext(
 		ctx,
 		"", // exchange vazia = default
 		routingKey,

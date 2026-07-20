@@ -9,6 +9,15 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 )
 
+// ConnectionManager interface para gerenciamento de conexão
+type ConnectionManager interface {
+	GetConnection() (*amqp091.Connection, error)
+	GetChannel() (*amqp091.Channel, error)
+	IsConnected() bool
+	Connect() error
+	Close()
+}
+
 // Garante que connectionManager implementa a interface ConnectionManager.
 var _ ConnectionManager = (*connectionManager)(nil)
 

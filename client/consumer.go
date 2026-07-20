@@ -14,14 +14,6 @@ import (
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
-// ConnectionManager interface para gerenciamento de conexão
-type ConnectionManager interface {
-	GetConnection() (*amqp091.Connection, error)
-	GetChannel() (*amqp091.Channel, error)
-	IsConnected() bool
-	Connect() error
-}
-
 // Consumer agora recebe um QueueManager e um ConnectionManager
 type Consumer struct {
 	connManager  ConnectionManager
