@@ -23,12 +23,12 @@ type ConnectionManager interface {
 
 // Consumer agora recebe um QueueManager e um ConnectionManager
 type Consumer struct {
-	connManager    ConnectionManager
-	queueManager   *queue.QueueManager
-	metrics        *metrics.Metrics
-	mu             sync.RWMutex
-	stopChan       chan struct{}
-	isRunning      bool
+	connManager  ConnectionManager
+	queueManager *queue.QueueManager
+	metrics      *metrics.Metrics
+	mu           sync.RWMutex
+	stopChan     chan struct{}
+	isRunning    bool
 }
 
 // NewConsumer cria um consumer com gerenciadores
@@ -71,7 +71,7 @@ func (c *Consumer) consumeWithReconnect(queueName string, handler middleware.Han
 				log.Printf("❌ Erro no consumo da fila %s: %v", queueName, err)
 				log.Printf("⏳ Tentando reconectar em 5 segundos...")
 				time.Sleep(5 * time.Second)
-				
+
 				// Tenta reconectar
 				if err := c.connManager.Connect(); err != nil {
 					log.Printf("❌ Falha na reconexão: %v", err)
@@ -106,8 +106,9 @@ func (c *Consumer) consume(queueName string, handler middleware.HandlerFunc, wor
 	finalHandler := middleware.Chain(
 		handler,
 		middleware.LoggingMiddleware,
-		c.metricsMiddleware,
-		c.dlqMiddleware(config),
+		middleware.OpenTelemetryMiddleware, // Adicionado
+		c.metricsMiddleware(queueName),     // Passa o nome da fila
+		c.dlqMiddleware(config, queueName),
 	)
 
 	// 5. Inicia consumo
@@ -238,7 +239,7 @@ func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error
 	}
 	delivery.Headers["x-dlq-reason"] = "max_retries_exceeded"
 	delivery.Headers["x-dlq-timestamp"] = time.Now()
-	
+
 	ch, err := c.connManager.GetChannel()
 	if err != nil {
 		return fmt.Errorf("error getting channel for DLQ publish: %w", err)
