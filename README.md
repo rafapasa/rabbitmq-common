@@ -25,6 +25,36 @@ go get -u github.com/rafapasa/rabbit-common
 # Como utilizar
 
 ##### Arquivo de configurações
+
+func main() {
+    // ... (inicia métricas)
+
+    // 1. Cria e inicia o ConnectionManager
+    connManager, err := client.NewConnectionManager("amqp://guest:guest@localhost:5672/")
+    if err != nil {
+        // O NewConnectionManager agora não retorna erro fatal, apenas loga.
+        // A aplicação pode continuar e o manager tentará reconectar.
+    }
+    // Garante que a conexão será fechada ao final
+    // defer connManager.Close() // Você precisaria adicionar o método Close() à interface
+
+    // 2. Configura o gerenciador de filas específico do projeto
+    queueManager := queue.SetupQueueManager()
+
+    // 3. Cria publisher com o ConnectionManager
+    publisher, _ := client.NewPublisher(connManager, queueManager)
+
+    // ... (publica mensagens)
+
+    // 4. Cria consumer com o ConnectionManager
+    consumer := client.NewConsumer(queueManager, connManager)
+
+    // ... (consome mensagens)
+
+    select {}
+}
+
+
 // projeto-orders/internal/queue/setup.go
 package queue
 

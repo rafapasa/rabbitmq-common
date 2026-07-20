@@ -10,6 +10,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rafapasa/rabbitmq-common/metrics"
 	"github.com/rafapasa/rabbitmq-common/middleware"
+	"github.com/rafapasa/rabbitmq-common/models"
 	"github.com/rafapasa/rabbitmq-common/queue"
 )
 
@@ -27,6 +28,7 @@ type Consumer struct {
 	queueManager *queue.QueueManager
 	metrics      *metrics.Metrics
 	mu           sync.RWMutex
+	activeQueues map[string]*models.ActiveQueue
 	stopChan     chan struct{}
 	isRunning    bool
 }
@@ -37,6 +39,7 @@ func NewConsumer(qm *queue.QueueManager, connManager ConnectionManager) *Consume
 		connManager:  connManager,
 		queueManager: qm,
 		metrics:      metrics.GetMetrics(),
+		activeQueues: make(map[string]*models.ActiveQueue),
 		stopChan:     make(chan struct{}),
 	}
 }
@@ -48,23 +51,26 @@ func (c *Consumer) Consume(
 	workers int,
 ) error {
 	c.mu.Lock()
-	if c.isRunning {
+	if _, exists := c.activeQueues[queueName]; exists {
 		c.mu.Unlock()
-		return fmt.Errorf("consumer already running for queue %s", queueName)
+		return fmt.Errorf("consumer for queue %s is already running", queueName)
 	}
-	c.isRunning = true
+	c.activeQueues[queueName] = &models.ActiveQueue{StopChan: make(chan struct{})}
 	c.mu.Unlock()
 
-	go c.consumeWithReconnect(queueName, handler, workers)
+	go c.consumeWithReconnect(queueName, handler, workers, c.activeQueues[queueName].StopChan)
 	return nil
 }
 
 // consumeWithReconnect mantém o consumo rodando mesmo com falhas
-func (c *Consumer) consumeWithReconnect(queueName string, handler middleware.HandlerFunc, workers int) {
+func (c *Consumer) consumeWithReconnect(queueName string, handler middleware.HandlerFunc, workers int, stopChan chan struct{}) {
 	for {
 		select {
-		case <-c.stopChan:
+		case <-stopChan:
 			log.Printf("🛑 Consumidor parado para fila: %s", queueName)
+			return
+		case <-c.stopChan: // Stop global
+			log.Printf("🛑 Consumidor global parado, encerrando fila: %s", queueName)
 			return
 		default:
 			if err := c.consume(queueName, handler, workers); err != nil {
@@ -95,7 +101,6 @@ func (c *Consumer) consume(queueName string, handler middleware.HandlerFunc, wor
 	if err != nil {
 		return err
 	}
-	defer ch.Close()
 
 	// 3. Configura a fila
 	if err := c.setupQueueWithChannel(ch, config); err != nil {
@@ -134,10 +139,20 @@ func (c *Consumer) consume(queueName string, handler middleware.HandlerFunc, wor
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for delivery := range deliveries {
-				ctx := context.Background()
-				if err := finalHandler(ctx, delivery); err != nil {
-					log.Printf("⚠️ Worker %d error: %v", workerID, err)
+			for {
+				select {
+				case delivery, ok := <-deliveries:
+					if !ok {
+						log.Printf("Canal de entregas fechado para fila %s, worker %d encerrando.", queueName, workerID)
+						return
+					}
+					ctx := context.Background()
+					if err := finalHandler(ctx, delivery); err != nil {
+						log.Printf("⚠️ Worker %d error: %v", workerID, err)
+					}
+				case <-c.stopChan:
+					log.Printf("Parada global solicitada, worker %d da fila %d encerrando.", workerID, workerID)
+					return
 				}
 			}
 		}(i)
@@ -267,13 +282,28 @@ func (c *Consumer) publishToDLQ(delivery amqp091.Delivery, dlqName string) error
 }
 
 // Stop para o consumidor
-func (c *Consumer) Stop() {
+func (c *Consumer) Stop(queueName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.isRunning {
-		close(c.stopChan)
-		c.isRunning = false
+	if aq, exists := c.activeQueues[queueName]; exists {
+		close(aq.StopChan)
+		delete(c.activeQueues, queueName)
+		log.Printf("Solicitando parada para o consumidor da fila: %s", queueName)
 	}
+}
+
+// StopAll para todos os consumidores ativos gerenciados por esta instância
+func (c *Consumer) StopAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.isRunning { // Previne fechamento duplo do canal global
+		return
+	}
+	c.isRunning = true // Marca que o processo de parada global foi iniciado
+
+	log.Printf("Solicitando parada para todos os consumidores...")
+	close(c.stopChan)
 }
 
 // getRetryCount (mesmo de antes)
