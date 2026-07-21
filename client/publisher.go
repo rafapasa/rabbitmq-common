@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -13,33 +12,21 @@ import (
 )
 
 type Publisher struct {
-	connManager ConnectionManager
-	//channel      *amqp091.Channel
+	connManager  ConnectionManager
 	metrics      *metrics.Metrics
 	queueManager *queue.QueueManager
 }
 
 func NewPublisher(cm ConnectionManager, qm *queue.QueueManager) (*Publisher, error) {
-	// ch, err := cm.GetChannel()
-	// if err != nil {
-	// 	return nil, err
-	// }
-
 	return &Publisher{
-		connManager: cm,
-		// channel:      ch,
+		connManager:  cm,
 		metrics:      metrics.GetMetrics(),
 		queueManager: qm,
 	}, nil
 }
 
 // Publish publica uma mensagem com routing key
-func (p *Publisher) Publish(ctx context.Context, routingKey string, payload interface{}) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("error serializing: %w", err)
-	}
-
+func (p *Publisher) Publish(ctx context.Context, routingKey string, body []byte) error {
 	// Obtém o nome da fila a partir do routing key (usando o manager do projeto)
 	queueName, exists := p.queueManager.GetQueueByRouting(routingKey)
 	if !exists {
